@@ -119,6 +119,33 @@ func TestSendCancelledDuringWait(t *testing.T) {
 	}
 }
 
+func TestSendCancelledDuringTokenFetch(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-release: // unblock when the test is done, so Close does not hang
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c, err := newClient(Config{TenantID: "t", ClientID: "app", ClientSecret: "abc~secret", From: "noreply@zuidwest.nl"}, srv.URL+"/token", srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-started
+		cancel()
+	}()
+	start := time.Now()
+	if err := c.Send(ctx, &Message{To: []string{"a@x.nl"}}); !errors.Is(err, context.Canceled) || time.Since(start) > 10*time.Second {
+		t.Errorf("err=%v after %v, want context.Canceled without waiting for the HTTP timeout", err, time.Since(start))
+	}
+}
+
 func TestSendCancelled(t *testing.T) {
 	f := &fakeGraph{handlers: []http.HandlerFunc{status(202, "")}}
 	ctx, cancel := context.WithCancel(t.Context())

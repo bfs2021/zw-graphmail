@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -54,7 +55,10 @@ type Attachment struct {
 // Client sends mail. It is safe for concurrent use.
 type Client struct {
 	cfg     Config
-	http    *http.Client
+	base    *http.Client
+	creds   clientcredentials.Config
+	mu      sync.Mutex
+	tok     *oauth2.Token
 	baseURL string
 	sleep   func(context.Context, time.Duration) error
 }
@@ -80,10 +84,27 @@ func newClient(cfg Config, tokenURL, baseURL string) (*Client, error) {
 	base := &http.Client{Timeout: 30 * time.Second}
 	return &Client{
 		cfg:     cfg,
-		http:    creds.Client(context.WithValue(context.Background(), oauth2.HTTPClient, base)),
+		base:    base,
+		creds:   creds,
 		baseURL: baseURL,
 		sleep:   sleep,
 	}, nil
+}
+
+// token returns a cached access token, fetching a new one if needed. The
+// fetch follows ctx, so cancelling it stops a hung token request right away.
+func (c *Client) token(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tok.Valid() {
+		return c.tok.AccessToken, nil
+	}
+	tok, err := c.creds.Token(context.WithValue(ctx, oauth2.HTTPClient, c.base))
+	if err != nil {
+		return "", fmt.Errorf("graphmail: token request: %w", err)
+	}
+	c.tok = tok
+	return tok.AccessToken, nil
 }
 
 // Send delivers m. It makes up to four attempts on 429, 500, 502, 503, 504
@@ -91,17 +112,20 @@ func newClient(cfg Config, tokenURL, baseURL string) (*Client, error) {
 // context deadline to limit that. A retry after a lost response can deliver
 // the mail twice, so this favours delivery over avoiding duplicates.
 func (c *Client) Send(ctx context.Context, m *Message) error {
-	// The token request does not follow ctx, so stop before it starts.
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("graphmail: %w", err)
 	}
 	if c.cfg.From == "" {
 		return errors.New("graphmail: from address is required to send")
 	}
+	tok, err := c.token(ctx)
+	if err != nil {
+		return err
+	}
 	payload, _ := json.Marshal(newMailRequest(m)) // only strings, maps and slices
 	endpoint := c.baseURL + "/users/" + url.PathEscape(c.cfg.From) + "/sendMail"
 	for attempt := 1; ; attempt++ {
-		retry, wait, err := c.post(ctx, endpoint, payload)
+		retry, wait, err := c.post(ctx, endpoint, payload, tok)
 		if !retry || attempt == maxAttempts {
 			return err
 		}
@@ -115,13 +139,14 @@ func (c *Client) Send(ctx context.Context, m *Message) error {
 }
 
 // post makes one attempt. wait is the server's Retry-After, or zero.
-func (c *Client) post(ctx context.Context, endpoint string, payload []byte) (retry bool, wait time.Duration, err error) {
+func (c *Client) post(ctx context.Context, endpoint string, payload []byte, tok string) (retry bool, wait time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return false, 0, fmt.Errorf("graphmail: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.base.Do(req)
 	if err != nil {
 		return ctx.Err() == nil, 0, fmt.Errorf("graphmail: %w", err)
 	}
@@ -162,12 +187,17 @@ func sleep(ctx context.Context, d time.Duration) error {
 // first three characters of each secret, so it returns the earliest expiry of
 // the unexpired secrets that start with those characters.
 func (c *Client) SecretExpiry(ctx context.Context) (time.Time, error) {
+	tok, err := c.token(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
 	endpoint := c.baseURL + "/applications(appId='" + url.PathEscape(c.cfg.ClientID) + "')?$select=passwordCredentials"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("graphmail: %w", err)
 	}
-	resp, err := c.http.Do(req)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.base.Do(req)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("graphmail: %w", err)
 	}
